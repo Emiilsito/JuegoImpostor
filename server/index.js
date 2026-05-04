@@ -92,7 +92,11 @@ io.on('connection', (socket) => {
     if (!yaEstaEnJuego) {
       const palabras = Object.keys(sdalData);
       const palabraSecreta = palabras[Math.floor(Math.random() * palabras.length)].toUpperCase();
-      const indices = lobby.players.map((_, i) => i).sort(() => Math.random() - 0.5);
+      const indices = lobby.players.map((_, i) => i);
+      for (let i = indices.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [indices[i], indices[j]] = [indices[j], indices[i]];
+      }
       const impostoresIndices = indices.slice(0, lobby.impostoresCount);
 
       lobby.players.forEach((player, index) => {
@@ -123,9 +127,12 @@ io.on('connection', (socket) => {
     const todosListos = jugadoresVivos.every(p => p.ready);
 
     if (todosListos) {
-      lobby.turnOrder = jugadoresVivos
-        .map(p => p.id)
-        .sort(() => Math.random() - 0.5);
+            const ids = jugadoresVivos.map(p => p.id);
+      for (let i = ids.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [ids[i], ids[j]] = [ids[j], ids[i]];
+      }
+      lobby.turnOrder = ids;
       lobby.currentTurnIndex = 0;
 
       io.to(lobbyId).emit('start_turns', {
@@ -223,7 +230,11 @@ io.on('connection', (socket) => {
     if (!resultado.gameEnded) {
       setTimeout(() => {
         lobby.votos = {};
-        lobby.players.forEach(p => { p.ready = false; });
+        lobby.players.forEach(p => {
+          p.ready = false;
+          p.role = null;   // ← AÑADIR ESTO
+          p.word = null;   // ← AÑADIR ESTO
+        });
         io.to(lobbyId).emit('game_started', lobby);
       }, 3000);
     }
