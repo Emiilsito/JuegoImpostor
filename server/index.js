@@ -1,52 +1,31 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const fs = require('fs');
-const path = require('path');
+const sdalData = require('./sdal.json');
 
 const app = express();
 const server = http.createServer(app);
 
-// Carga de seguridad del JSON
-let sdalData = {};
-try {
-  const jsonPath = path.join(__dirname, 'sdal.json');
-  if (fs.existsSync(jsonPath)) {
-    sdalData = require('./sdal.json');
-  } else {
-    console.error("CRÍTICO: No se encontró sdal.json. Usando datos de prueba.");
-    sdalData = { "EJEMPLO": ["dato1", "dato2"] };
-  }
-} catch (err) {
-  console.error("Error cargando sdal.json:", err);
-}
-
+// 🔥 CONFIGURACIÓN PARA WEBSOCKETS PUROS
 const io = new Server(server, {
   cors: {
     origin: "*",
     methods: ["GET", "POST"]
-  }
+  },
+  // ⛔️ Desactivamos polling, solo permitimos websockets
+  transports: ['websocket'],
+  allowEIO3: true
 });
 
-app.use(express.json());
-
+// Mantener el healthcheck para Railway
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', online: true });
-});
-
-app.get('/', (req, res) => {
-  res.send('Servidor Impostor Operativo');
+  res.status(200).send('OK');
 });
 
 const lobbies = {};
 
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+function shuffle(array) {
+  return array.sort(() => Math.random() - 0.5);
 }
 
 const broadcastLobbies = () => {
@@ -62,12 +41,12 @@ const broadcastLobbies = () => {
 function asignarRoles(lobby) {
   const palabras = Object.keys(sdalData);
   const palabraSecreta = palabras[Math.floor(Math.random() * palabras.length)].toUpperCase();
-
+  
   const indices = shuffle(lobby.players.map((_, i) => i));
-  const impostoresIndices = new Set(indices.slice(0, lobby.impostoresCount));
+  const impostoresIndices = indices.slice(0, lobby.impostoresCount || 1);
 
   lobby.players.forEach((player, index) => {
-    const esImpostor = impostoresIndices.has(index);
+    const esImpostor = impostoresIndices.includes(index);
     player.role = esImpostor ? 'impostor' : 'civil';
     player.word = esImpostor ? 'IMPOSTOR' : palabraSecreta;
     player.alive = true;
@@ -76,7 +55,7 @@ function asignarRoles(lobby) {
 }
 
 io.on('connection', (socket) => {
-  console.log(`Usuario conectado: ${socket.id}`);
+  console.log(`Conexión WS directa: ${socket.id}`);
   broadcastLobbies();
 
   socket.on('create_lobby', ({ hostName }) => {
@@ -99,29 +78,17 @@ io.on('connection', (socket) => {
     const lobby = lobbies[lobbyId];
     if (lobby && lobby.status === 'waiting' && lobby.players.length < lobby.maxPlayers) {
       if (lobby.players.some(p => p.id === socket.id)) return;
-
       lobby.players.push({ id: socket.id, name: playerName, role: null, word: null, ready: false, alive: true });
       socket.join(lobbyId);
       socket.emit('joined_successfully', lobby);
       io.to(lobbyId).emit('lobby_updated', lobby);
       broadcastLobbies();
-    } else {
-      socket.emit('error_message', 'Sala llena o no encontrada');
     }
-  });
-
-  socket.on('set_impostores_count', ({ lobbyId, count }) => {
-    const lobby = lobbies[lobbyId];
-    if (!lobby || lobby.hostId !== socket.id) return;
-    const maxImpostores = Math.max(1, Math.floor((lobby.players.length - 1) / 2));
-    lobby.impostoresCount = Math.min(Math.max(1, count), maxImpostores);
-    io.to(lobbyId).emit('lobby_updated', lobby);
   });
 
   socket.on('start_game', ({ lobbyId }) => {
     const lobby = lobbies[lobbyId];
-    if (!lobby || lobby.hostId !== socket.id || lobby.players.length < 3) return;
-    
+    if (!lobby || lobby.hostId !== socket.id) return;
     asignarRoles(lobby);
     lobby.status = 'playing';
     io.to(lobbyId).emit('game_started', lobby);
@@ -136,28 +103,8 @@ io.on('connection', (socket) => {
 
     const jugadoresVivos = lobby.players.filter(p => p.alive);
     if (jugadoresVivos.every(p => p.ready)) {
-      lobby.turnOrder = shuffle(jugadoresVivos.map(p => p.id));
-      lobby.currentTurnIndex = 0;
-      io.to(lobbyId).emit('start_turns', {
-        turnOrder: lobby.turnOrder,
-        currentTurnIndex: 0,
-        players: lobby.players
-      });
-    } else {
-      io.to(lobbyId).emit('lobby_updated', lobby);
-    }
-  });
-
-  socket.on('next_turn', ({ lobbyId }) => {
-    const lobby = lobbies[lobbyId];
-    if (!lobby || lobby.turnOrder[lobby.currentTurnIndex] !== socket.id) return;
-
-    lobby.currentTurnIndex++;
-    if (lobby.currentTurnIndex >= lobby.turnOrder.length) {
       lobby.timeLeft = 10;
-      lobby.votos = {};
       io.to(lobbyId).emit('start_voting_timer', { timeLeft: lobby.timeLeft });
-      
       const timer = setInterval(() => {
         lobby.timeLeft--;
         io.to(lobbyId).emit('timer_update', lobby.timeLeft);
@@ -167,11 +114,7 @@ io.on('connection', (socket) => {
         }
       }, 1000);
     } else {
-      io.to(lobbyId).emit('start_turns', {
-        turnOrder: lobby.turnOrder,
-        currentTurnIndex: lobby.currentTurnIndex,
-        players: lobby.players
-      });
+      io.to(lobbyId).emit('lobby_updated', lobby);
     }
   });
 
@@ -179,15 +122,16 @@ io.on('connection', (socket) => {
     const lobby = lobbies[lobbyId];
     if (!lobby) return;
     lobby.votos[votedId] = (lobby.votos[votedId] || 0) + 1;
-    const votosEmitidos = Object.values(lobby.votos).reduce((a, b) => a + b, 0);
-    io.to(lobbyId).emit('votes_update', { voted: votosEmitidos, total: lobby.players.filter(p => p.alive).length });
+    io.to(lobbyId).emit('votes_update', { 
+      voted: Object.values(lobby.votos).reduce((a, b) => a + b, 0), 
+      total: lobby.players.filter(p => p.alive).length 
+    });
   });
 
   function procesarVotacion(lobbyId) {
     const lobby = lobbies[lobbyId];
     if (!lobby) return;
-
-    let expulsadoId = Object.keys(lobby.votos).reduce((a, b) => (lobby.votos[a] > lobby.votos[b] ? a : b), null);
+    let expulsadoId = Object.keys(lobby.votos).reduce((a, b) => lobby.votos[a] > lobby.votos[b] ? a : b, null);
     const expulsado = lobby.players.find(p => p.id === expulsadoId);
     if (expulsado) expulsado.alive = false;
 
@@ -202,24 +146,20 @@ io.on('connection', (socket) => {
     const civilesVivos = lobby.players.filter(p => p.alive && p.role === 'civil').length;
     const impostoresVivos = lobby.players.filter(p => p.alive && p.role === 'impostor').length;
 
-    if (impostoresVivos === 0) {
-      resultado.gameEnded = true;
-      resultado.ganador = 'civiles';
-    } else if (impostoresVivos >= civilesVivos) {
-      resultado.gameEnded = true;
-      resultado.ganador = 'impostores';
-    }
+    if (impostoresVivos === 0) { resultado.gameEnded = true; resultado.ganador = 'civiles'; }
+    else if (impostoresVivos >= civilesVivos) { resultado.gameEnded = true; resultado.ganador = 'impostores'; }
 
     io.to(lobbyId).emit('voting_result', resultado);
 
     if (!resultado.gameEnded) {
       setTimeout(() => {
         lobby.votos = {};
-        asignarRoles(lobby);
-        io.to(lobbyId).emit('game_started', lobby);
+        lobby.players.forEach(p => p.ready = false);
+        io.to(lobbyId).emit('lobby_updated', lobby);
       }, 4000);
     } else {
       lobby.status = 'waiting';
+      broadcastLobbies();
     }
   }
 
@@ -228,10 +168,8 @@ io.on('connection', (socket) => {
       const lobby = lobbies[id];
       lobby.players = lobby.players.filter(p => p.id !== socket.id);
       if (lobby.players.length === 0) delete lobbies[id];
-      else {
-        if (lobby.hostId === socket.id) lobby.hostId = lobby.players[0].id;
-        io.to(id).emit('lobby_updated', lobby);
-      }
+      else if (lobby.hostId === socket.id) lobby.hostId = lobby.players[0].id;
+      io.to(id).emit('lobby_updated', lobby);
     });
     broadcastLobbies();
   });
@@ -239,5 +177,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`>>> Servidor Impostor ejecutándose en puerto ${PORT}`);
+  console.log(`>>> Servidor WS puro en puerto ${PORT}`);
 });
