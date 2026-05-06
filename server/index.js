@@ -16,6 +16,8 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 app.get('/', (req, res) => res.status(200).send('Servidor Operativo'));
 
 const lobbies = {};
+// --- NUEVO: Objeto para rastrear expulsiones pendientes ---
+const pendingExpulsions = {};
 
 function shuffle(array) {
   return array.sort(() => Math.random() - 0.5);
@@ -42,6 +44,19 @@ function asignarRoles(lobby) {
   });
 }
 
+// --- NUEVO: Función auxiliar para ejecutar la expulsión física ---
+function ejecutarExpulsionFisica(socketId) {
+  Object.keys(lobbies).forEach(id => {
+    const l = lobbies[id];
+    l.players = l.players.filter(x => x.id !== socketId);
+    if (l.players.length === 0) delete lobbies[id];
+    else if (l.hostId === socketId && l.players.length > 0) l.hostId = l.players[0].id;
+    io.to(id).emit('lobby_updated', l);
+  });
+  broadcastLobbies();
+  delete pendingExpulsions[socketId];
+}
+
 io.on('connection', (socket) => {
   broadcastLobbies();
 
@@ -58,9 +73,29 @@ io.on('connection', (socket) => {
 
   socket.on('join_lobby', ({ lobbyId, playerName }) => {
     const lobby = lobbies[lobbyId];
-    if (lobby && lobby.status === 'waiting') {
-      lobby.players.push({ id: socket.id, name: playerName, role: null, word: null, ready: false, alive: true });
-      socket.join(lobbyId);
+    if (lobby) {
+      // --- NUEVO: Lógica de Reconexión ---
+      const existingPlayer = lobby.players.find(p => p.name === playerName);
+      if (existingPlayer) {
+        // Cancelar expulsión si estaba pendiente
+        if (pendingExpulsions[existingPlayer.id]) {
+          clearTimeout(pendingExpulsions[existingPlayer.id]);
+          delete pendingExpulsions[existingPlayer.id];
+        }
+        // Actualizar el ID del socket al nuevo
+        existingPlayer.id = socket.id;
+        socket.join(lobbyId);
+        
+        // Si el juego ya está en curso, lo mandamos directo a jugar
+        if (lobby.status === 'playing') {
+          socket.emit('game_started', lobby);
+        }
+      } else if (lobby.status === 'waiting') {
+        // Unirse normal si es una sala nueva
+        lobby.players.push({ id: socket.id, name: playerName, role: null, word: null, ready: false, alive: true });
+        socket.join(lobbyId);
+      }
+      
       socket.emit('joined_successfully', lobby);
       io.to(lobbyId).emit('lobby_updated', lobby);
       broadcastLobbies();
@@ -106,31 +141,23 @@ io.on('connection', (socket) => {
   });
 
   socket.on('next_turn', ({ lobbyId }) => {
-    const lobby = lobbies[lobbyId];
-    if (!lobby || lobby.turnOrder[lobby.currentTurnIndex] !== socket.id) return;
+      const lobby = lobbies[lobbyId];
+      if (!lobby || lobby.turnOrder[lobby.currentTurnIndex] !== socket.id) return;
 
-    lobby.currentTurnIndex++;
+      lobby.currentTurnIndex++;
 
-    if (lobby.currentTurnIndex >= lobby.turnOrder.length) {
-      lobby.timeLeft = 10;
-      lobby.votos = {};
-      io.to(lobbyId).emit('start_voting_timer', { timeLeft: lobby.timeLeft });
-      const timer = setInterval(() => {
-        lobby.timeLeft--;
-        io.to(lobbyId).emit('timer_update', lobby.timeLeft);
-        if (lobby.timeLeft <= 0) {
-          clearInterval(timer);
-          procesarVotacion(lobbyId);
-        }
-      }, 1000);
-    } else {
-      io.to(lobbyId).emit('start_turns', {
-        turnOrder: lobby.turnOrder,
-        currentTurnIndex: lobby.currentTurnIndex,
-        players: lobby.players
-      });
-    }
-  });
+      if (lobby.currentTurnIndex >= lobby.turnOrder.length) {
+        // HEMOS QUITADO EL TIMER. Ahora pasamos directo a la fase de votación.
+        lobby.votos = {};
+        io.to(lobbyId).emit('start_voting_phase'); // Nueva señal sin tiempo
+      } else {
+        io.to(lobbyId).emit('start_turns', {
+          turnOrder: lobby.turnOrder,
+          currentTurnIndex: lobby.currentTurnIndex,
+          players: lobby.players
+        });
+      }
+    });
 
   socket.on('flip_coin', ({ lobbyId }) => {
     const lobby = lobbies[lobbyId];
@@ -138,7 +165,6 @@ io.on('connection', (socket) => {
 
     const resultado = Math.random() < 0.5 ? 'CARA' : 'CRUZ';
     
-    // Enviamos el resultado a todos en la sala
     io.to(lobbyId).emit('coin_result', { 
       resultado, 
       lanzador: lobby.players.find(p => p.id === socket.id)?.name 
@@ -149,13 +175,27 @@ io.on('connection', (socket) => {
     const lobby = lobbies[lobbyId];
     if (!lobby) return;
     const votante = lobby.players.find(p => p.id === socket.id);
-    if (!votante || !votante.alive) return; // No votan los muertos
+    if (!votante || !votante.alive) return;
 
     lobby.votos[votedId] = (lobby.votos[votedId] || 0) + 1;
+    
+    const numVotos = Object.values(lobby.votos).reduce((a, b) => a + b, 0);
+    const numVivos = lobby.players.filter(x => x.alive).length;
+
     io.to(lobbyId).emit('votes_update', { 
-      voted: Object.values(lobby.votos).reduce((a, b) => a + b, 0), 
-      total: lobby.players.filter(x => x.alive).length 
+      voted: numVotos, 
+      total: numVivos 
     });
+
+    // Si todos han votado, procesamos el resultado automáticamente
+    if (numVotos >= numVivos) {
+      procesarVotacion(lobbyId);
+    }
+  });
+
+  // --- NUEVO: Botón de salida manual (Borrado instantáneo) ---
+  socket.on('leave_lobby', () => {
+    ejecutarExpulsionFisica(socket.id);
   });
 
   function procesarVotacion(lobbyId) {
@@ -173,7 +213,7 @@ io.on('connection', (socket) => {
     const res = {
       expulsadoNombre: exp ? exp.name : "Nadie",
       esImpostor: exp?.role === 'impostor',
-      palabraCorrecta: fin ? lobby.players.find(x => x.role === 'civil')?.word : "????", // Oculto si no es el fin
+      palabraCorrecta: fin ? lobby.players.find(x => x.role === 'civil')?.word : "????",
       gameEnded: fin,
       ganador: impVivos === 0 ? 'civiles' : (impVivos >= civVivos ? 'impostores' : null)
     };
@@ -193,15 +233,13 @@ io.on('connection', (socket) => {
     }
   }
 
+  // --- MODIFICADO: Desconexión con retraso de 2 minutos ---
   socket.on('disconnect', () => {
-    Object.keys(lobbies).forEach(id => {
-      const l = lobbies[id];
-      l.players = l.players.filter(x => x.id !== socket.id);
-      if (l.players.length === 0) delete lobbies[id];
-      else if (l.hostId === socket.id) l.hostId = l.players[0].id;
-      io.to(id).emit('lobby_updated', l);
-    });
-    broadcastLobbies();
+    const socketId = socket.id;
+    // Programamos la limpieza para dentro de 120 segundos (2 minutos)
+    pendingExpulsions[socketId] = setTimeout(() => {
+      ejecutarExpulsionFisica(socketId);
+    }, 120000);
   });
 });
 
